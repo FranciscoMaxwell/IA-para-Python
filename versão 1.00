@@ -1,0 +1,223 @@
+# IA-para-3D com Python
+# Projeto Autocad, Criação de imagens 3D com Python
+import bpy
+import bmesh
+import numpy as np
+from bpy.props import (
+    StringProperty, IntProperty, FloatProperty, BoolProperty, EnumProperty
+)
+from bpy.types import Operator, Panel, PropertyGroup
+from PIL import Image, ImageFilter
+
+# Função de pré-processamento da imagem
+def preprocess_image(path, resolution=256, auto_resize=True, filter_type='NONE', filter_size=3, blur_iterations=1):
+    img = Image.open(path).convert("L")
+    if auto_resize:
+        img = img.resize((resolution, resolution), Image.LANCZOS)
+    if filter_type == 'MEDIAN':
+        img = img.filter(ImageFilter.MedianFilter(size=filter_size))
+    elif filter_type == 'BLUR':
+        for _ in range(blur_iterations):
+            img = img.filter(ImageFilter.BoxBlur(1))
+    arr = np.array(img, dtype=np.float32) / 255.0
+    return arr
+
+# Função para gerar mesh a partir do heightmap
+def generate_mesh(heightmap, strength=1.0, size_x=1.0, size_y=1.0, size_z=1.0, create_solid=False, thickness=0.05, invert=False):
+    res_y, res_x = heightmap.shape
+    verts = []
+    faces = []
+
+    max_val = np.max(heightmap)
+    if max_val == 0:
+        max_val = 1.0
+
+    for y in range(res_y):
+        for x in range(res_x):
+            h = heightmap[y, x]
+            if invert:
+                h = 1.0 - h
+            z = (h / max_val) * strength * size_z
+            verts.append((x / (res_x - 1) * size_x, y / (res_y - 1) * size_y, z))
+
+    for y in range(res_y - 1):
+        for x in range(res_x - 1):
+            v1 = y * res_x + x
+            v2 = v1 + 1
+            v3 = v1 + res_x + 1
+            v4 = v1 + res_x
+            faces.append((v1, v2, v3, v4))
+
+    if create_solid:
+        base_offset = len(verts)
+        for y in range(res_y):
+            for x in range(res_x):
+                verts.append((x / (res_x - 1) * size_x, y / (res_y - 1) * size_y, -thickness))
+        for y in range(res_y - 1):
+            for x in range(res_x - 1):
+                v1 = base_offset + y * res_x + x
+                v2 = v1 + 1
+                v3 = v1 + res_x + 1
+                v4 = v1 + res_x
+                faces.append((v1, v4, v3, v2))
+        for x in range(res_x - 1):
+            v1 = x
+            v2 = x + 1
+            v3 = base_offset + x + 1
+            v4 = base_offset + x
+            faces.append((v1, v2, v3, v4))
+            v1 = (res_y - 1) * res_x + x
+            v2 = v1 + 1
+            v3 = base_offset + v2
+            v4 = base_offset + v1
+            faces.append((v1, v2, v3, v4))
+        for y in range(res_y - 1):
+            v1 = y * res_x
+            v2 = v1 + res_x
+            v3 = base_offset + v2
+            v4 = base_offset + v1
+            faces.append((v1, v2, v3, v4))
+            v1 = y * res_x + (res_x - 1)
+            v2 = v1 + res_x
+            v3 = base_offset + v2
+            v4 = base_offset + v1
+            faces.append((v1, v2, v3, v4))
+
+    mesh = bpy.data.meshes.new("ImageMesh")
+    mesh.from_pydata(verts, [], faces)
+    mesh.update(calc_edges=True)
+    try:
+        mesh.validate()
+    except Exception:
+        pass
+    try:
+        bm_calc = bmesh.new()
+        bm_calc.from_mesh(mesh)
+        bmesh.ops.recalc_face_normals(bm_calc, faces=bm_calc.faces)
+        bm_calc.to_mesh(mesh)
+        bm_calc.free()
+    except Exception:
+        if hasattr(mesh, "calc_normals"):
+            mesh.calc_normals()
+        elif hasattr(mesh, "calc_normals_split"):
+            mesh.calc_normals_split()
+
+    obj = bpy.data.objects.new("Image3D", mesh)
+    bpy.context.collection.objects.link(obj)
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+    return obj
+
+class IMAGE3DProperties(PropertyGroup):
+    filepath: StringProperty(
+        name="Imagem",
+        description="Selecione a imagem",
+        subtype='FILE_PATH'
+    )
+    resolution: IntProperty(
+        name="Resolução",
+        default=256,
+        min=16,
+        max=2048
+    )
+    strength: FloatProperty(
+        name="Força do Relevo",
+        default=1.0,
+        min=0.0,
+        max=100.0
+    )
+    size_x: FloatProperty(name="Tamanho X (m)", default=1.0, min=0.01, max=100.0)
+    size_y: FloatProperty(name="Tamanho Y (m)", default=1.0, min=0.01, max=100.0)
+    size_z: FloatProperty(name="Tamanho Z (m)", default=1.0, min=0.01, max=100.0)
+    auto_resize: BoolProperty(name="Auto Redimensionar", default=True)
+    filter_type: EnumProperty(
+        name="Filtro",
+        items=[
+            ('NONE', "Nenhum", "Sem filtro"),
+            ('MEDIAN', "Mediana", "Filtro de mediana"),
+            ('BLUR', "Blur", "Suavização")
+        ],
+        default='NONE'
+    )
+    filter_size: IntProperty(name="Tamanho do Filtro", default=3, min=1, max=10)
+    blur_iterations: IntProperty(name="Iterações de Blur", default=1, min=1, max=10)
+    create_solid: BoolProperty(name="Gerar Sólido", default=False)
+    thickness: FloatProperty(name="Espessura", default=0.05)
+    invert: BoolProperty(name="Inverter Alturas", default=False)
+
+class IMG3D_OT_generate(Operator):
+    bl_idname = "img3d.generate"
+    bl_label = "Gerar Geometria 3D"
+
+    def execute(self, context):
+        props = context.scene.img3d_props
+        try:
+            arr = preprocess_image(
+                props.filepath,
+                resolution=props.resolution,
+                auto_resize=props.auto_resize,
+                filter_type=props.filter_type,
+                filter_size=props.filter_size,
+                blur_iterations=props.blur_iterations
+            )
+            obj = generate_mesh(
+                arr,
+                strength=props.strength,
+                size_x=props.size_x,
+                size_y=props.size_y,
+                size_z=props.size_z,
+                create_solid=props.create_solid,
+                thickness=props.thickness,
+                invert=props.invert
+            )
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, f"Erro: {e}")
+            return {'CANCELLED'}
+
+class IMG3D_PT_panel(Panel):
+    bl_label = "Imagem -> 3D"
+    bl_idname = "IMG3D_PT_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'Image3D'
+
+    def draw(self, context):
+        layout = self.layout
+        props = context.scene.img3d_props
+        layout.prop(props, "filepath")
+        layout.prop(props, "resolution")
+        layout.prop(props, "strength")
+        layout.prop(props, "size_x")
+        layout.prop(props, "size_y")
+        layout.prop(props, "size_z")
+        layout.prop(props, "auto_resize")
+        layout.prop(props, "filter_type")
+        if props.filter_type != 'NONE':
+            layout.prop(props, "filter_size")
+            if props.filter_type == 'BLUR':
+                layout.prop(props, "blur_iterations")
+        layout.prop(props, "create_solid")
+        if props.create_solid:
+            layout.prop(props, "thickness")
+        layout.prop(props, "invert")
+        layout.operator("img3d.generate")
+
+classes = (
+    IMAGE3DProperties,
+    IMG3D_OT_generate,
+    IMG3D_PT_panel,
+)
+
+def register():
+    for cls in classes:
+        bpy.utils.register_class(cls)
+    bpy.types.Scene.img3d_props = bpy.props.PointerProperty(type=IMAGE3DProperties)
+
+def unregister():
+    for cls in reversed(classes):
+        bpy.utils.unregister_class(cls)
+    del bpy.types.Scene.img3d_props
+
+if __name__ == "__main__":
+    register()
